@@ -1,67 +1,50 @@
-# Payload Blank Template
+# Payload relationship `where` conditions dropped with MongoDB
 
-This template comes configured with the bare minimum to get started on anything you need.
+## Setup
 
-## Quick start
+This is a minimal app (Payload 3.90.2, `@payloadcms/db-mongodb`) for demonstrating the issue. There are 2 collections:
 
-This template can be deployed directly from our Cloud hosting and it will setup MongoDB and cloud S3 object storage for media.
+- `categories` with `slug` and `state` fields, and a read access function returning a `Where`: `{ state: { not_equals: 'hidden' } }`
+- `posts` with a `category` relationship and an optional `subtitle`
 
-## Quick Start - local setup
+The repro is an integration test running against `mongodb-memory-server`, so no database is needed.
 
-To spin up this template locally, follow these steps:
+## The issue
 
-### Clone
+With access control enforced (`overrideAccess: false`), querying through a relationship silently drops other conditions from the same `where` object:
 
-After you click the `Deploy` button above, you'll want to have standalone copy of this repo on your machine. If you've already cloned this repo, skip to [Development](#development).
+```ts
+await payload.find({
+  collection: 'posts',
+  overrideAccess: false,
+  where: {
+    'category.slug': { equals: 'a' },
+    'category.state': { equals: 'active' },
+  },
+})
+```
 
-### Development
+This returns posts from **every** readable category, not just category `a`. The same happens when a relationship condition sits next to an `exists` condition — the `exists` condition is ignored.
 
-1. First [clone the repo](#clone) if you have not done so already
-2. `cd my-project && cp .env.example .env` to copy the example environment variables. You'll need to add the `MONGODB_URL` from your Cloud project to your `.env` if you want to use S3 storage and the MongoDB database that was created for you.
+Wrapping the same conditions in `and: [...]` returns the correct result.
 
-3. `pnpm install && pnpm dev` to install dependencies and start the dev server
-4. open `http://localhost:3000` to open the app in your browser
+## Cause
 
-That's it! Changes made in `./src` will be reflected in your app. Follow the on-screen instructions to login and create your first admin user. Then check out [Production](#production) once you're ready to build and serve your app, and [Deployment](#deployment) when you're ready to go live.
+Two things combine:
 
-#### Docker (Optional)
+1. `validateSearchParams` (`payload/dist/database/queryValidation/validateSearchParams.js`) appends the related collection's read access to the **same** `where` object as an `and` key: `where.and = [...existingAnd, { 'category.state': { not_equals: 'hidden' } }]`.
+2. `parseParams` in `@payloadcms/db-mongodb` stores some conditions under `$and` — two conditions resolving to the same path (`category.slug` and `category.state` both become `category: { $in: [...] }`), multiple operators on one field, and `exists` / `like` raw queries. When it later reaches the `and` key it assigns `result.$and = builtConditions`, overwriting them.
 
-If you prefer to use Docker for local development instead of a local MongoDB instance, the provided docker-compose.yml file can be used.
+The query sent to MongoDB ends up containing only the access constraint.
 
-To do so, follow these steps:
+Step 2 alone is also reachable without access control, by writing an explicit `and` next to such conditions (last test).
 
-- Modify the `MONGODB_URL` in your `.env` file to `mongodb://127.0.0.1/<dbname>`
-- Modify the `docker-compose.yml` file's `MONGODB_URL` to match the above `<dbname>`
-- Run `docker-compose up` to start the database, optionally pass `-d` to run in the background.
+## Repro steps
 
-## How it works
-
-The Payload config is tailored specifically to the needs of most websites. It is pre-configured in the following ways:
-
-### Collections
-
-See the [Collections](https://payloadcms.com/docs/configuration/collections) docs for details on how to extend this functionality.
-
-- #### Users (Authentication)
-
-  Users are auth-enabled collections that have access to the admin panel.
-
-  For additional help, see the official [Auth Example](https://github.com/payloadcms/payload/tree/3.x/examples/auth) or the [Authentication](https://payloadcms.com/docs/authentication/overview#authentication-overview) docs.
-
-- #### Media
-
-  This is the uploads enabled collection. It features pre-configured sizes, focal point and manual resizing to help you manage your pictures.
-
-### Docker
-
-Alternatively, you can use [Docker](https://www.docker.com) to spin up this template locally. To do so, follow these steps:
-
-1. Follow [steps 1 and 2 from above](#development), the docker-compose file will automatically use the `.env` file in your project root
-1. Next run `docker-compose up`
-1. Follow [steps 4 and 5 from above](#development) to login and create your first admin user
-
-That's it! The Docker instance will help you get up and running quickly while also standardizing the development environment across your teams.
-
-## Questions
-
-If you have any issues or questions, reach out to us on [Discord](https://discord.com/invite/payload) or start a [GitHub discussion](https://github.com/payloadcms/payload/discussions).
+- `pnpm install`
+- `pnpm test:int`
+- Observe 3 failing tests in `tests/int/relationshipWhere.int.spec.ts`:
+  - two conditions on the same relationship — returns Post B from category `b`
+  - relationship condition next to an `exists` condition — `exists` is ignored
+  - two conditions on the same relationship next to an explicit `and` (`overrideAccess: true`) — `category.*` conditions are ignored
+- The control test, with the same conditions wrapped in `and: [...]`, passes
